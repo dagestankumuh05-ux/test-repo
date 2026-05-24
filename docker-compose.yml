@@ -1,0 +1,56 @@
+version: "3.9"
+
+# ────────────────────────────────────────────────────────────────────────────
+# Telegram Market Bot — Docker Compose
+#
+# Запуск:
+#   docker compose up -d
+#
+# Просмотр логов:
+#   docker compose logs -f market-bot
+#
+# Обновление:
+#   docker compose pull && docker compose up -d --build
+# ────────────────────────────────────────────────────────────────────────────
+
+services:
+  market-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: telegram-market-bot
+    restart: unless-stopped
+
+    # ── Переменные окружения ───────────────────────────────────────────────
+    # Создайте .env файл из .env.example перед запуском
+    env_file:
+      - .env
+
+    # ── Тома ──────────────────────────────────────────────────────────────
+    volumes:
+      # Логи снаружи контейнера для удобного просмотра
+      - ./logs:/app/logs
+
+    # ── Ресурсы ───────────────────────────────────────────────────────────
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
+
+    # ── Логирование ───────────────────────────────────────────────────────
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    # ── Healthcheck ───────────────────────────────────────────────────────
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.exit(0)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

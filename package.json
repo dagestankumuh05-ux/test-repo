@@ -1,0 +1,30 @@
+{
+  "name": "telegram-market-bot",
+  "version": "1.0.0",
+  "description": "Daily morning market briefing Telegram bot",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "node --experimental-vm-modules index.js --dry-run"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "node-cron": "^3.0.3",
+    "winston": "^3.14.2"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "market",
+    "crypto",
+    "forex",
+    "cron"
+  ],
+  "author": "",
+  "license": "MIT"
+}

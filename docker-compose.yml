@@ -29,14 +29,19 @@ services:
     env_file:
       - .env
 
-    # Монтируем директорию логов на хост для доступа снаружи контейнера
+    # Монтируем директории на хост для доступа снаружи контейнера
     volumes:
-      - ./logs:/app/logs
+      - ./logs:/app/logs     # Файлы логов Winston
+      - ./state:/app/state   # Персистентное состояние (last-send, quota, lock)
 
-    # Временная зона контейнера
+    # Переменные окружения контейнера
     environment:
       - TZ=Europe/Amsterdam
       - NODE_ENV=production
+
+    # Порт health-сервера (доступен снаружи для мониторинга)
+    ports:
+      - "3000:3000"
 
     # Настройки логирования Docker
     logging:

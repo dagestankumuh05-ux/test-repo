@@ -1,152 +1,161 @@
 /**
  * utils/logger.js
  *
- * Простой логгер с записью в консоль и файл.
- * Не использует внешние зависимости — только стандартный fs модуль.
- * Файлы логов создаются в ./logs/ с именем по дате (YYYY-MM-DD.log).
+ * Winston-логгер с:
+ * - Автоматической ротацией файлов (ежедневно + по размеру)
+ * - Отдельным файлом для ошибок (error.log)
+ * - Correlation ID в каждой записи (через AsyncLocalStorage)
+ * - JSON-формат в файлах, читаемый формат в консоли
+ * - Поддержкой уровней: debug | info | warn | error
+ *
+ * Документация Winston: https://github.com/winstonjs/winston
+ * Ротация файлов: https://github.com/winstonjs/winston-daily-rotate-file
  */
 
-import fs from 'fs';
+import winston from 'winston';
+import 'winston-daily-rotate-file';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { getCorrelationId } from './correlationId.js';
+import { LOGGING } from '../config/constants.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const LOGS_DIR = path.join(__dirname, '..', 'logs');
-
-// Создаём директорию для логов, если не существует
-if (!fs.existsSync(LOGS_DIR)) {
-  fs.mkdirSync(LOGS_DIR, { recursive: true });
-}
-
-// ANSI-цвета для консольного вывода
-const COLORS = {
-  reset:  '\x1b[0m',
-  gray:   '\x1b[90m',
-  green:  '\x1b[32m',
-  yellow: '\x1b[33m',
-  red:    '\x1b[31m',
-  blue:   '\x1b[34m',
-  bold:   '\x1b[1m',
-};
-
-/**
- * Форматирует текущее время для вывода в консоль (HH:MM:SS).
- * @returns {string}
- */
-function getTime() {
-  return new Date().toLocaleTimeString('ru-RU', {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  });
-}
-
-/**
- * Возвращает ISO-timestamp для логов (UTC).
- * @returns {string}
- */
-function getISO() {
-  return new Date().toISOString();
-}
-
-/**
- * Возвращает дату для имени файла лога (YYYY-MM-DD).
- * @returns {string}
- */
-function getLogDate() {
-  return new Date().toISOString().split('T')[0];
-}
-
-/**
- * Записывает строку в файл лога.
- * Файл создаётся/дополняется автоматически.
- * @param {string} line - Строка для записи
- */
-function writeToFile(line) {
-  try {
-    const logPath = path.join(LOGS_DIR, `${getLogDate()}.log`);
-    fs.appendFileSync(logPath, line + '\n', 'utf8');
-  } catch (err) {
-    // Не выбрасываем ошибку — логгер не должен ломать приложение
-    console.error('[LOGGER] Ошибка записи в файл:', err.message);
-  }
-}
-
-/**
- * Основная функция логирования.
- * @param {string} level - Уровень: INFO | WARN | ERROR
- * @param {string} color - ANSI-цвет для консоли
- * @param {string} message - Сообщение
- * @param {*} [data] - Дополнительные данные (объект или строка)
- */
-function log(level, color, message, data) {
-  const iso = getISO();
-  const time = getTime();
-
-  // Консольный вывод с цветами
-  let consoleMsg = `${COLORS.gray}${time}${COLORS.reset} ${color}${level}${COLORS.reset} ${message}`;
-  if (data !== undefined) {
-    const dataStr = typeof data === 'object' ? JSON.stringify(data, null, 0) : String(data);
-    consoleMsg += ` ${COLORS.gray}${dataStr}${COLORS.reset}`;
-  }
-  console.log(consoleMsg);
-
-  // Файловый вывод (JSON, без цветов)
-  const fileEntry = JSON.stringify({
-    timestamp: iso,
-    level,
-    message,
-    ...(data !== undefined && { data }),
-  });
-  writeToFile(fileEntry);
-}
+const LOGS_DIR = path.join(__dirname, '..', LOGGING.LOGS_DIR);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Экспортируемый логгер
+// Форматы
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Добавляет correlation ID к каждой записи лога.
+ */
+const addCorrelationId = winston.format((info) => {
+  info.correlationId = getCorrelationId();
+  return info;
+});
+
+/**
+ * JSON-формат для файлов: компактный, машиночитаемый.
+ */
+const fileFormat = winston.format.combine(
+  addCorrelationId(),
+  winston.format.timestamp({ format: 'YYYY-MM-DDTHH:mm:ss.SSSZ' }),
+  winston.format.errors({ stack: true }),
+  winston.format.json()
+);
+
+/**
+ * Читаемый формат для консоли с цветами.
+ */
+const consoleFormat = winston.format.combine(
+  addCorrelationId(),
+  winston.format.timestamp({ format: 'HH:mm:ss' }),
+  winston.format.errors({ stack: true }),
+  winston.format.colorize({ level: true }),
+  winston.format.printf(({ timestamp, level, message, correlationId, stack, ...meta }) => {
+    const cid = correlationId && correlationId !== 'no-ctx'
+      ? ` \x1b[90m[${correlationId}]\x1b[0m`
+      : '';
+    const metaStr = Object.keys(meta).length
+      ? ` \x1b[90m${JSON.stringify(meta, null, 0)}\x1b[0m`
+      : '';
+    const stackStr = stack ? `\n\x1b[31m${stack}\x1b[0m` : '';
+    return `\x1b[90m${timestamp}\x1b[0m ${level}${cid} ${message}${metaStr}${stackStr}`;
+  })
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Транспорты
+// ─────────────────────────────────────────────────────────────────────────────
+
+const level = process.env.LOG_LEVEL || LOGGING.DEFAULT_LEVEL;
+
+const transports = [
+  // Консоль
+  new winston.transports.Console({
+    format: consoleFormat,
+    handleExceptions: true,
+    handleRejections: true,
+  }),
+
+  // Все логи → logs/app-YYYY-MM-DD.log
+  new winston.transports.DailyRotateFile({
+    dirname:      LOGS_DIR,
+    filename:     'app-%DATE%.log',
+    datePattern:  LOGGING.DATE_PATTERN,
+    maxFiles:     LOGGING.MAX_FILES,
+    maxSize:      LOGGING.MAX_SIZE,
+    format:       fileFormat,
+    auditFile:    path.join(LOGS_DIR, '.audit-app.json'),
+    handleExceptions: false,
+  }),
+
+  // Только ошибки → logs/error-YYYY-MM-DD.log
+  new winston.transports.DailyRotateFile({
+    dirname:      LOGS_DIR,
+    filename:     'error-%DATE%.log',
+    datePattern:  LOGGING.DATE_PATTERN,
+    maxFiles:     LOGGING.MAX_FILES,
+    maxSize:      LOGGING.MAX_SIZE,
+    level:        'error',
+    format:       fileFormat,
+    auditFile:    path.join(LOGS_DIR, '.audit-error.json'),
+    handleExceptions: false,
+  }),
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Создание логгера
+// ─────────────────────────────────────────────────────────────────────────────
+
+const winstonLogger = winston.createLogger({
+  level,
+  transports,
+  exitOnError: false,   // Не завершать процесс при ошибке логгера
+  silent:      false,
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Публичный интерфейс (обратная совместимость + расширения)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const logger = {
-  /**
-   * Информационное сообщение (стандартные события).
-   * @param {string} message
-   * @param {*} [data]
-   */
-  info: (message, data) => log('INFO ', COLORS.green, message, data),
-
-  /**
-   * Предупреждение (некритические проблемы, пропущенные данные).
-   * @param {string} message
-   * @param {*} [data]
-   */
-  warn: (message, data) => log('WARN ', COLORS.yellow, message, data),
-
-  /**
-   * Ошибка (неудачные запросы, критические сбои).
-   * @param {string} message
-   * @param {*} [data]
-   */
-  error: (message, data) => log('ERROR', COLORS.red, message, data),
-
-  /**
-   * Отладочное сообщение (только при LOG_LEVEL=debug).
-   * @param {string} message
-   * @param {*} [data]
-   */
-  debug: (message, data) => {
-    if (process.env.LOG_LEVEL === 'debug') {
-      log('DEBUG', COLORS.blue, message, data);
+  debug: (message, meta = {}) => winstonLogger.debug(message, meta),
+  info:  (message, meta = {}) => winstonLogger.info(message, meta),
+  warn:  (message, meta = {}) => winstonLogger.warn(message, meta),
+  error: (message, meta = {}) => {
+    // Если meta.error — это Error объект, сохраняем stack
+    if (meta instanceof Error) {
+      winstonLogger.error(message, { error: meta.message, stack: meta.stack });
+    } else if (meta?.error instanceof Error) {
+      winstonLogger.error(message, { ...meta, errorStack: meta.error.stack, error: meta.error.message });
+    } else {
+      winstonLogger.error(message, meta);
     }
   },
 
   /**
-   * Разделитель для визуального разграничения секций в логах.
+   * Визуальный разделитель в консоли.
    * @param {string} [title]
    */
   separator: (title = '') => {
-    const line = '─'.repeat(50);
-    const msg = title ? `${line} ${title} ${line}` : line.repeat(2);
-    console.log(`${COLORS.gray}${msg}${COLORS.reset}`);
-    writeToFile(`{"timestamp":"${getISO()}","level":"SEP ","message":"${title || '---'}"}`);
+    const line = '─'.repeat(48);
+    const msg  = title ? `${line} ${title} ${line}` : line + line;
+    winstonLogger.info(msg);
   },
+
+  /**
+   * Логирует метрики производительности.
+   * @param {string} operation
+   * @param {number} latencyMs
+   * @param {object} [extra]
+   */
+  perf: (operation, latencyMs, extra = {}) => {
+    winstonLogger.info(`⏱ ${operation}`, { latencyMs, ...extra });
+  },
+
+  /**
+   * Получить внутренний winston-логгер (для интеграций).
+   */
+  raw: winstonLogger,
 };

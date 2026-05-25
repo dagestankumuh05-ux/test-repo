@@ -44,8 +44,8 @@ COPY services/ ./services/
 COPY utils/ ./utils/
 COPY package.json ./
 
-# Создаём директорию для логов
-RUN mkdir -p logs
+# Создаём директории для логов и состояния
+RUN mkdir -p logs state
 
 # Используем непривилегированного пользователя (безопасность)
 # node:20-alpine включает пользователя node (uid=1000)

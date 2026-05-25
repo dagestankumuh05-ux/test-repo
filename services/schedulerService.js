@@ -1,161 +1,243 @@
 /**
  * services/schedulerService.js
  *
- * Сервис планировщика задач на основе node-cron.
- * Запускает ежедневную рыночную сводку по расписанию.
+ * Планировщик с защитой от дублирования выполнения.
  *
- * Временная зона: Europe/Amsterdam (CET зимой, CEST летом)
- * По умолчанию: 07:00 каждый день
- *
- * Документация node-cron: https://github.com/node-cron/node-cron
- * Формат cron: секунды(опц.) минуты часы дни_месяца месяцы дни_недели
- *
- * Примеры:
- *   "0 7 * * *"     = 07:00 каждый день
- *   "0 7 * * 1-5"   = 07:00 только будни (Пн-Пт)
- *   "0 7,19 * * *"  = 07:00 и 19:00 каждый день
+ * Гарантии:
+ * - Singleton lock: второй запуск не начнётся пока первый не завершился
+ * - Автоматическое определение timezone (Europe/Amsterdam = CET/CEST)
+ * - Метрики продолжительности каждого запуска
+ * - Correlation ID для трассировки каждого запуска
+ * - Graceful shutdown: текущий запуск может завершиться перед остановкой
  */
 
 import cron from 'node-cron';
-import { config } from '../config/index.js';
-import { logger } from '../utils/logger.js';
-import { fetchMarketData } from './marketService.js';
-import { sendMarketBriefing } from './telegramService.js';
+import { config }             from '../config/index.js';
+import { logger }             from '../utils/logger.js';
+import { runWithId, generateCronId } from '../utils/correlationId.js';
+import { SCHEDULER }          from '../config/constants.js';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Основной обработчик задачи
-// ─────────────────────────────────────────────────────────────────────────────
+export class SchedulerService {
+  #task     = null;    // node-cron task
+  #metrics  = null;    // MetricsService
+  #state    = null;    // StateService
+  #market   = null;    // MarketService
+  #telegram = null;    // TelegramService
+  #isRunning = false;  // Флаг текущего выполнения
 
-/**
- * Выполняет полный цикл: получение данных → форматирование → отправка.
- * Обрабатывает все ошибки внутри себя (не выбрасывает наружу).
- *
- * @returns {Promise<void>}
- */
-export async function runMarketBriefing() {
-  const jobStartTime = Date.now();
-
-  logger.separator('ЗАПУСК РЫНОЧНОЙ СВОДКИ');
-  logger.info('Начало формирования рыночной сводки...');
-
-  try {
-    // Шаг 1: Получить данные от Twelve Data API
-    const marketData = await fetchMarketData();
-
-    // Шаг 2: Отправить сформированное сообщение в Telegram
-    await sendMarketBriefing(marketData);
-
-    const elapsed = Date.now() - jobStartTime;
-    logger.info(`✅ Рыночная сводка отправлена за ${elapsed}ms`);
-    logger.separator();
-  } catch (error) {
-    const elapsed = Date.now() - jobStartTime;
-    logger.error(`❌ Ошибка при отправке рыночной сводки (${elapsed}ms)`, {
-      error: error.message,
-      stack: error.stack,
-    });
-    logger.separator();
-    // Не перебрасываем ошибку — планировщик должен продолжать работу
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Запуск планировщика
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Инициализирует и запускает cron-планировщик.
- *
- * @returns {cron.ScheduledTask} - Экземпляр задачи (можно остановить через .stop())
- */
-export function startScheduler() {
-  const { cronExpression, timezone, runOnStart } = config.schedule;
-
-  // Валидация cron-выражения перед запуском
-  if (!cron.validate(cronExpression)) {
-    throw new Error(
-      `Неверное cron-выражение: "${cronExpression}"\n` +
-      `Пример корректного выражения: "0 7 * * *" (каждый день в 07:00)`
-    );
+  /**
+   * @param {object} deps
+   * @param {import('./marketService.js').MarketService}     deps.market
+   * @param {import('./telegramService.js').TelegramService} deps.telegram
+   * @param {import('./metricsService.js').MetricsService}   deps.metrics
+   * @param {import('./stateService.js').StateService}       deps.state
+   */
+  constructor(deps) {
+    this.#market   = deps.market;
+    this.#telegram = deps.telegram;
+    this.#metrics  = deps.metrics;
+    this.#state    = deps.state;
   }
 
-  logger.info('Инициализация планировщика...', {
-    cron: cronExpression,
-    timezone,
-    описание: 'каждый день в 07:00 CET',
-  });
+  // ─────────────────────────────────────────────────────────────────────────
+  // Запуск задачи
+  // ─────────────────────────────────────────────────────────────────────────
 
-  // Создаём cron-задачу
-  const task = cron.schedule(
-    cronExpression,
-    async () => {
-      logger.info('⏰ Сработал cron-триггер. Запускаю рыночную сводку...');
-      await runMarketBriefing();
-    },
-    {
-      timezone,
-      scheduled: true,  // Запустить сразу при создании
-    }
-  );
+  /**
+   * Выполняет один цикл рыночной сводки.
+   * Защищён от параллельного выполнения через:
+   * 1. In-memory флаг this.#isRunning
+   * 2. Persistent lock в StateService (защита от перезапуска процесса)
+   *
+   * @param {object} [opts]
+   * @param {boolean} [opts.force]  - Пропустить lock-проверку (для тестов)
+   * @returns {Promise<void>}
+   */
+  async runJob(opts = {}) {
+    const correlationId = generateCronId();
 
-  logger.info('✅ Планировщик запущен');
+    await runWithId(correlationId, async () => {
+      const startMs = Date.now();
 
-  // Вычисляем следующий запуск для информационного сообщения
-  logNextRunTime(cronExpression, timezone);
-
-  // Если RUN_ON_START=true — запустить сразу (полезно для тестирования)
-  if (runOnStart) {
-    logger.info('🚀 RUN_ON_START=true: запускаю сводку немедленно...');
-    // Небольшая задержка для полной инициализации
-    setTimeout(() => runMarketBriefing(), 1000);
-  }
-
-  return task;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Вспомогательные функции
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Вычисляет и логирует время следующего запуска задачи.
- * Использует простое вычисление для cron "0 H * * *".
- *
- * @param {string} cronExpr
- * @param {string} timezone
- */
-function logNextRunTime(cronExpr, timezone) {
-  try {
-    // Парсим часы из cron-выражения "0 H * * *"
-    const parts = cronExpr.split(' ');
-    if (parts.length === 5 && parts[2] === '*') {
-      const hour = parseInt(parts[1], 10);
-      const minute = parseInt(parts[0], 10);
-
-      if (!isNaN(hour) && !isNaN(minute)) {
-        const now = new Date();
-        const nextRun = new Date();
-        nextRun.setHours(hour, minute, 0, 0);
-
-        // Если время уже прошло сегодня — следующий запуск завтра
-        if (nextRun <= now) {
-          nextRun.setDate(nextRun.getDate() + 1);
-        }
-
-        const timeStr = nextRun.toLocaleString('ru-RU', {
-          timeZone: timezone,
-          weekday: 'long',
-          day: 'numeric',
-          month: 'long',
-          hour: '2-digit',
-          minute: '2-digit',
+      // ── In-memory lock ─────────────────────────────────────────────────
+      if (this.#isRunning && !opts.force) {
+        logger.warn('Job already running in this process (in-memory lock). Skipping.', {
+          correlationId,
         });
+        return;
+      }
 
-        logger.info(`📅 Следующий запуск: ${timeStr} (${timezone})`);
+      // ── Persistent lock ────────────────────────────────────────────────
+      if (!opts.force && this.#state) {
+        const acquired = this.#state.acquireLock(correlationId);
+        if (!acquired) {
+          logger.warn('Job is locked by another execution. Skipping.', { correlationId });
+          return;
+        }
+      }
+
+      this.#isRunning = true;
+      this.#metrics?.increment('cron.executions');
+      this.#metrics?.setGauge('cron.lastRunAt', new Date().toISOString());
+
+      logger.separator(`CRON JOB START [${correlationId}]`);
+      logger.info('⏰ Запуск ежедневной рыночной сводки');
+
+      try {
+        // Шаг 1: Получить данные
+        const marketData = await this.#market.fetchMarketData();
+
+        // Шаг 2: Отправить в Telegram
+        const result = await this.#telegram.sendMarketBriefing(marketData);
+
+        const duration = Date.now() - startMs;
+        this.#metrics?.recordLatency('cron.duration', duration);
+        this.#metrics?.setGauge('cron.lastDurationMs', duration);
+
+        if (result.sent) {
+          logger.info(`✅ Сводка отправлена за ${duration}ms`, {
+            messageId: result.messageId,
+            duration,
+          });
+        } else {
+          logger.info(`⏭  Сводка пропущена (${result.reason}) за ${duration}ms`);
+        }
+      } catch (error) {
+        this.#metrics?.increment('cron.failures');
+        const duration = Date.now() - startMs;
+        logger.error(`❌ Ошибка при выполнении cron-задачи (${duration}ms)`, {
+          error: error.message,
+          stack: error.stack,
+        });
+      } finally {
+        this.#isRunning = false;
+        if (!opts.force) this.#state?.releaseLock();
+
+        // Логируем использование памяти после каждого запуска
+        this.#metrics?.logMemoryUsage();
+        logger.separator(`CRON JOB END [${correlationId}]`);
+      }
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Управление планировщиком
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Запускает cron-планировщик.
+   * @returns {this}
+   */
+  start() {
+    const { cronExpression, timezone, runOnStart } = config.schedule;
+
+    // Валидация cron-выражения
+    if (!cron.validate(cronExpression)) {
+      throw new Error(
+        `Неверное cron-выражение: "${cronExpression}"\n` +
+        `Пример: "0 7 * * *" (ежедневно в 07:00)\n` +
+        `Проверка: https://crontab.guru/`
+      );
+    }
+
+    logger.info('Инициализация планировщика', {
+      cron:        cronExpression,
+      timezone,
+      runOnStart,
+    });
+
+    // Вычисляем и логируем следующий запуск
+    this.#logNextRun(cronExpression, timezone);
+
+    // Создаём cron-задачу
+    this.#task = cron.schedule(
+      cronExpression,
+      () => {
+        // Намеренно не await — cron не ждёт callback
+        this.runJob().catch((err) => {
+          logger.error('Unhandled error in cron callback', { error: err.message });
+        });
+      },
+      { timezone, scheduled: true }
+    );
+
+    logger.info('✅ Планировщик запущен');
+
+    // Немедленный запуск если RUN_ON_START=true
+    if (runOnStart) {
+      logger.info('🚀 RUN_ON_START=true: запуск немедленно...');
+      setTimeout(() => this.runJob({ force: true }), 500);
+    }
+
+    return this;
+  }
+
+  /**
+   * Останавливает cron-планировщик.
+   * Если job сейчас выполняется — ждём до MAX_JOB_DURATION_MS.
+   * @returns {Promise<void>}
+   */
+  async stop() {
+    logger.info('Остановка планировщика...');
+
+    if (this.#task) {
+      this.#task.stop();
+      this.#task = null;
+    }
+
+    // Ждём завершения текущего job
+    if (this.#isRunning) {
+      logger.info('Job выполняется, ожидаем завершения...');
+      const deadline = Date.now() + SCHEDULER.MAX_JOB_DURATION_MS;
+
+      while (this.#isRunning && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 500));
+      }
+
+      if (this.#isRunning) {
+        logger.warn('Job не завершился в срок, принудительная остановка');
       }
     }
-  } catch {
-    // Не критично, просто логируем без времени
-    logger.info(`📅 Расписание: ${cronExpr} (${timezone})`);
+
+    logger.info('⏹  Планировщик остановлен');
+  }
+
+  async teardown() {
+    await this.stop();
+  }
+
+  /** Возвращает статус планировщика */
+  getStatus() {
+    return {
+      running:   !!this.#task,
+      jobActive: this.#isRunning,
+    };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Helpers
+  // ─────────────────────────────────────────────────────────────────────────
+
+  #logNextRun(cronExpr, timezone) {
+    try {
+      const [minute, hour] = cronExpr.split(' ').map(Number);
+      if (!isNaN(hour) && !isNaN(minute)) {
+        const next = new Date();
+        next.setHours(hour, minute, 0, 0);
+        if (next <= new Date()) next.setDate(next.getDate() + 1);
+
+        const formatted = next.toLocaleString('ru-RU', {
+          timeZone: timezone,
+          weekday: 'long',
+          day:     'numeric',
+          month:   'long',
+          hour:    '2-digit',
+          minute:  '2-digit',
+        });
+        logger.info(`📅 Следующий запуск: ${formatted} (${timezone})`);
+      }
+    } catch {
+      // Некритично
+    }
   }
 }

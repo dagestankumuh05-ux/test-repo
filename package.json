@@ -1,17 +1,21 @@
 {
   "name": "telegram-market-bot",
-  "version": "1.0.0",
-  "description": "Ежедневный утренний рыночный дайджест для Telegram (BTC, ETH, Forex, Gold, Brent, IMOEX, S&P500)",
+  "version": "2.0.0",
+  "description": "Production-ready Telegram daily market briefing bot (BTC, ETH, Forex, Gold, Brent, IMOEX, S&P500)",
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js",
-    "send-now": "cross-env RUN_ON_START=true node index.js"
+    "start":     "node index.js",
+    "dev":       "node --watch index.js",
+    "send-now":  "cross-env RUN_ON_START=true node index.js",
+    "health":    "curl -s http://localhost:3000/health | node --input-type=module --eval 'import fs from \"fs\"; const d=JSON.parse(fs.readFileSync(\"/dev/stdin\",\"utf8\")); console.log(JSON.stringify(d,null,2));'"
   },
   "dependencies": {
-    "dotenv": "^16.4.5",
-    "node-cron": "^3.0.3"
+    "dotenv":                  "^16.4.5",
+    "node-cron":               "^3.0.3",
+    "winston":                 "^3.17.0",
+    "winston-daily-rotate-file": "^5.0.0",
+    "zod":                     "^3.25.28"
   },
   "devDependencies": {
     "cross-env": "^7.0.3"
@@ -20,12 +24,8 @@
     "node": ">=20.0.0"
   },
   "keywords": [
-    "telegram",
-    "bot",
-    "market",
-    "finance",
-    "crypto",
-    "twelve-data"
+    "telegram", "bot", "market", "finance",
+    "crypto", "twelve-data", "cron", "monitoring"
   ],
   "license": "MIT"
 }

@@ -1,86 +1,93 @@
 /**
  * config/index.js
  *
- * Централизованная конфигурация приложения.
- * Загружает переменные окружения из .env и валидирует обязательные параметры.
+ * Централизованная конфигурация с Zod-валидацией.
+ * Загружает .env, парсит значения, валидирует схему.
+ *
+ * При невалидной конфигурации — детальная ошибка с указанием проблемных полей.
  */
 
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import { validateConfig } from './schema.js';
+import { API, SCHEDULER, HEALTH, LOGGING } from './constants.js';
 
-// Re-export INSTRUMENTS для обратной совместимости
+// Re-export для удобства
 export { INSTRUMENTS } from './instruments.js';
+export { API, SCHEDULER, HEALTH, LOGGING, TELEGRAM, STATE, EXIT_CODES, SYMBOL } from './constants.js';
 
-// Загружаем .env из корня проекта
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Загружаем .env из корня проекта (не бросаем ошибку если файл отсутствует —
+// в production переменные могут приходить из окружения системы/Docker)
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
-/**
- * Получает обязательную переменную окружения.
- * Если переменная не задана — выбрасывает ошибку при старте.
- * @param {string} name - Имя переменной
- * @returns {string}
- */
-function requireEnv(name) {
-  const value = process.env[name];
-  if (!value || value.includes('your_') || value.includes('_here')) {
-    throw new Error(
-      `\n❌ Отсутствует обязательная переменная окружения: ${name}\n` +
-      `   Скопируйте .env.example в .env и заполните все значения.\n` +
-      `   Документация: README.md`
-    );
+// ─────────────────────────────────────────────────────────────────────────────
+// Вспомогательные функции чтения env
+// ─────────────────────────────────────────────────────────────────────────────
+
+function env(name, fallback = undefined) {
+  const v = process.env[name];
+  if (!v || v.trim() === '' || v.includes('_here') || v.includes('your_')) {
+    return fallback;
   }
-  return value.trim();
+  return v.trim();
 }
 
-/**
- * Получает необязательную переменную окружения с дефолтным значением.
- * @param {string} name - Имя переменной
- * @param {string} defaultValue - Значение по умолчанию
- * @returns {string}
- */
-function optionalEnv(name, defaultValue) {
-  const value = process.env[name];
-  return value && value.trim() ? value.trim() : defaultValue;
+function envInt(name, fallback) {
+  const v = env(name);
+  const n = parseInt(v, 10);
+  return isNaN(n) ? fallback : n;
 }
 
-// Инструменты вынесены в отдельный файл (без зависимости от env)
-// и реэкспортируются выше через: export { INSTRUMENTS } from './instruments.js'
+function envBool(name, fallback = false) {
+  const v = env(name);
+  if (v === undefined) return fallback;
+  return v.toLowerCase() === 'true';
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Основная конфигурация
+// Сборка и валидация конфигурации
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const config = {
+const raw = {
   telegram: {
-    botToken: requireEnv('TELEGRAM_BOT_TOKEN'),
-    chatId: requireEnv('TELEGRAM_CHAT_ID'),
+    botToken: env('TELEGRAM_BOT_TOKEN'),
+    chatId:   env('TELEGRAM_CHAT_ID'),
   },
 
   twelveData: {
-    apiKey: requireEnv('TWELVE_DATA_API_KEY'),
-    baseUrl: 'https://api.twelvedata.com',
-    timeout: parseInt(optionalEnv('API_TIMEOUT_MS', '15000'), 10),
-    retries: parseInt(optionalEnv('API_RETRIES', '3'), 10),
-    retryDelay: parseInt(optionalEnv('API_RETRY_DELAY_MS', '2000'), 10),
+    apiKey:     env('TWELVE_DATA_API_KEY'),
+    baseUrl:    env('TWELVE_DATA_BASE_URL', API.TWELVE_DATA_BASE_URL),
+    timeout:    envInt('API_TIMEOUT_MS',    API.DEFAULT_TIMEOUT_MS),
+    retries:    envInt('API_RETRIES',       API.DEFAULT_RETRIES),
+    retryDelay: envInt('API_RETRY_DELAY_MS', API.DEFAULT_RETRY_DELAY),
+    dailyQuota: envInt('API_DAILY_QUOTA',   API.QUOTA_DAILY_FREE),
   },
 
   schedule: {
-    // Cron-выражение: "0 7 * * *" = каждый день в 07:00
-    cronExpression: optionalEnv('CRON_EXPRESSION', '0 7 * * *'),
-    // Временная зона: CET/CEST (Europe/Amsterdam)
-    timezone: 'Europe/Amsterdam',
-    // Запустить немедленно при старте (для тестирования)
-    runOnStart: optionalEnv('RUN_ON_START', 'false') === 'true',
+    cronExpression: env('CRON_EXPRESSION', SCHEDULER.DEFAULT_CRON),
+    timezone:       env('TZ_CRON',         SCHEDULER.DEFAULT_TIMEZONE),
+    runOnStart:     envBool('RUN_ON_START', false),
+  },
+
+  health: {
+    enabled: envBool('HEALTH_ENABLED', true),
+    port:    envInt('HEALTH_PORT',    HEALTH.DEFAULT_PORT),
   },
 
   logging: {
-    level: optionalEnv('LOG_LEVEL', 'info'),
+    level:    env('LOG_LEVEL',      LOGGING.DEFAULT_LEVEL),
+    maxFiles: env('LOG_MAX_FILES',  LOGGING.MAX_FILES),
+    maxSize:  env('LOG_MAX_SIZE',   LOGGING.MAX_SIZE),
   },
 
   app: {
-    nodeEnv: optionalEnv('NODE_ENV', 'production'),
-    version: '1.0.0',
+    nodeEnv: env('NODE_ENV', 'production'),
+    version: '2.0.0',
   },
 };
+
+// Валидируем через Zod (бросает Error при невалидных значениях)
+export const config = validateConfig(raw);

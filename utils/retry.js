@@ -1,77 +1,83 @@
 /**
  * utils/retry.js
  *
- * Утилита для повторных попыток асинхронных операций
- * с экспоненциальной задержкой (exponential backoff).
- *
- * Использование:
- *   const data = await withRetry(() => fetchSomething(), { retries: 3, delay: 1000 });
+ * Retry с exponential backoff + correlation ID в логах.
+ * Поддерживает jitter для предотвращения thundering herd.
  */
 
 import { logger } from './logger.js';
+import { API } from '../config/constants.js';
 
-/**
- * Задержка на указанное количество миллисекунд.
- * @param {number} ms - Время ожидания в мс
- * @returns {Promise<void>}
- */
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Выполняет асинхронную функцию с автоматическими повторными попытками.
- *
- * @param {Function} fn        - Асинхронная функция для выполнения
- * @param {object}   [options] - Параметры повторных попыток
- * @param {number}   [options.retries=3]      - Максимальное число повторов
- * @param {number}   [options.delay=1000]     - Начальная задержка в мс
- * @param {number}   [options.backoff=2]      - Множитель задержки (экспоненциальный рост)
- * @param {number}   [options.maxDelay=30000] - Максимальная задержка в мс
- * @param {string}   [options.label='']       - Метка для логов
- * @param {Function} [options.shouldRetry]    - Функция: error => boolean (стоит ли повторять)
- * @returns {Promise<*>} - Результат успешного выполнения fn
- * @throws {Error} - Бросает последнюю ошибку если все попытки исчерпаны
+ * Добавляет случайный jitter к задержке (±25%).
+ * Предотвращает одновременный retry нескольких инстансов.
  */
-export async function withRetry(fn, options = {}) {
-  const {
-    retries = 3,
-    delay = 1000,
-    backoff = 2,
-    maxDelay = 30_000,
-    label = '',
-    shouldRetry = () => true,
-  } = options;
+function jitter(ms) {
+  return ms * (0.75 + Math.random() * 0.5);
+}
 
-  let lastError;
+/**
+ * Выполняет async-функцию с retry и exponential backoff.
+ *
+ * @param {Function} fn          - Async-функция для выполнения
+ * @param {object}  [opts]
+ * @param {number}  [opts.retries=3]
+ * @param {number}  [opts.delay=2000]       - Начальная задержка (мс)
+ * @param {number}  [opts.backoff=2]        - Множитель задержки
+ * @param {number}  [opts.maxDelay=30000]   - Максимальная задержка
+ * @param {boolean} [opts.useJitter=true]   - Добавлять jitter к задержке
+ * @param {string}  [opts.label='']         - Метка для логов
+ * @param {Function}[opts.shouldRetry]      - (error) => boolean
+ * @param {Function}[opts.onRetry]          - (attempt, error) => void
+ * @returns {Promise<*>}
+ */
+export async function withRetry(fn, opts = {}) {
+  const {
+    retries     = API.DEFAULT_RETRIES,
+    delay       = API.DEFAULT_RETRY_DELAY,
+    backoff     = API.RETRY_BACKOFF,
+    maxDelay    = API.MAX_RETRY_DELAY,
+    useJitter   = true,
+    label       = '',
+    shouldRetry = () => true,
+    onRetry     = null,
+  } = opts;
+
   const tag = label ? `[${label}] ` : '';
+  let lastError;
 
   for (let attempt = 1; attempt <= retries + 1; attempt++) {
     try {
-      // Успешное выполнение — возвращаем результат
       return await fn();
     } catch (error) {
       lastError = error;
 
-      // Проверяем, нужно ли повторять при этой ошибке
+      // Не повторять если shouldRetry вернул false
       if (!shouldRetry(error)) {
-        logger.warn(`${tag}Повтор пропущен (ошибка не позволяет retry): ${error.message}`);
+        logger.debug(`${tag}Retry пропущен (shouldRetry=false)`, { error: error.message });
         throw error;
       }
 
-      // Последняя попытка — не ждём, сразу выбрасываем
+      // Последняя попытка — не ждать
       if (attempt > retries) {
-        logger.error(`${tag}Все ${retries + 1} попытки исчерпаны. Последняя ошибка: ${error.message}`);
+        logger.error(`${tag}Все попытки исчерпаны (${retries + 1}/${retries + 1})`, {
+          error: error.message,
+        });
         break;
       }
 
-      // Вычисляем задержку: delay * backoff^(attempt-1), но не больше maxDelay
-      const waitMs = Math.min(delay * Math.pow(backoff, attempt - 1), maxDelay);
+      // Вычисляем задержку
+      let waitMs = Math.min(delay * Math.pow(backoff, attempt - 1), maxDelay);
+      if (useJitter) waitMs = Math.round(jitter(waitMs));
 
       logger.warn(
-        `${tag}Попытка ${attempt}/${retries + 1} не удалась. ` +
-        `Следующая попытка через ${waitMs}ms...`,
+        `${tag}Попытка ${attempt}/${retries + 1} не удалась. Повтор через ${waitMs}ms`,
         { error: error.message }
       );
 
+      if (onRetry) onRetry(attempt, error);
       await sleep(waitMs);
     }
   }
@@ -80,27 +86,21 @@ export async function withRetry(fn, options = {}) {
 }
 
 /**
- * Выполняет несколько функций параллельно, каждая с retry-логикой.
- * Возвращает массив результатов (null для неудачных).
+ * Выполняет набор задач параллельно, каждую с retry.
+ * Возвращает массив результатов (null для провалившихся).
  *
- * @param {Array<{fn: Function, label: string}>} tasks - Задачи для выполнения
- * @param {object} retryOptions - Параметры retry (применяются ко всем задачам)
+ * @param {Array<{ fn: Function, label: string }>} tasks
+ * @param {object} [retryOpts]
  * @returns {Promise<Array<*|null>>}
  */
-export async function withRetryParallel(tasks, retryOptions = {}) {
-  const results = await Promise.allSettled(
-    tasks.map(({ fn, label }) =>
-      withRetry(fn, { ...retryOptions, label })
-    )
+export async function withRetryParallel(tasks, retryOpts = {}) {
+  const settled = await Promise.allSettled(
+    tasks.map(({ fn, label }) => withRetry(fn, { ...retryOpts, label }))
   );
 
-  return results.map((result, i) => {
-    if (result.status === 'fulfilled') {
-      return result.value;
-    }
-    logger.error(`Задача "${tasks[i].label}" провалилась окончательно`, {
-      error: result.reason?.message,
-    });
+  return settled.map((result, i) => {
+    if (result.status === 'fulfilled') return result.value;
+    logger.error(`Задача "${tasks[i].label}" провалилась`, { error: result.reason?.message });
     return null;
   });
 }

@@ -3,169 +3,248 @@
  *
  * Сервис отправки сообщений через Telegram Bot API.
  *
- * Документация Telegram Bot API: https://core.telegram.org/bots/api#sendmessage
- * Используется parse_mode: HTML для форматирования.
- *
- * Лимиты Telegram Bot API:
- *   - Не более 30 сообщений/сек для одного бота
- *   - Не более 20 сообщений/мин в одну группу
- *   - Максимальная длина сообщения: 4096 символов
+ * Возможности:
+ * - Защита от flood limits (TelegramRateLimiter)
+ * - Message deduplication (StateService.isDuplicate)
+ * - Retry с shouldRetry (не повторять при 401/403/404)
+ * - Автоматическая обработка 429 (flood control от Telegram)
+ * - Correlation ID в каждом запросе
+ * - Метрики latency/success/failed
  */
 
-import { config } from '../config/index.js';
-import { withRetry } from '../utils/retry.js';
-import { logger } from '../utils/logger.js';
+import { config }            from '../config/index.js';
+import { withRetry }         from '../utils/retry.js';
+import { logger }            from '../utils/logger.js';
+import { getCorrelationId }  from '../utils/correlationId.js';
 import { formatMarketMessage } from '../utils/formatter.js';
+import { TelegramRateLimiter } from '../middleware/rateLimiter.js';
+import { TELEGRAM }          from '../config/constants.js';
 
-// Базовый URL Telegram Bot API
-const TG_API_BASE = `https://api.telegram.org/bot${config.telegram.botToken}`;
+export class TelegramService {
+  #token;
+  #chatId;
+  #limiter;
+  #metrics;
+  #state;
+  #baseUrl;
 
-// Максимальная длина одного сообщения Telegram
-const MAX_MESSAGE_LENGTH = 4096;
+  /**
+   * @param {object} [deps]
+   * @param {import('../services/metricsService.js').MetricsService} [deps.metrics]
+   * @param {import('../services/stateService.js').StateService}     [deps.state]
+   */
+  constructor(deps = {}) {
+    this.#token   = config.telegram.botToken;
+    this.#chatId  = config.telegram.chatId;
+    this.#baseUrl = `https://api.telegram.org/bot${this.#token}`;
+    this.#limiter = new TelegramRateLimiter();
+    this.#metrics = deps.metrics ?? null;
+    this.#state   = deps.state   ?? null;
+  }
 
-// Таймаут для Telegram API запросов (10 секунд)
-const TELEGRAM_TIMEOUT_MS = 10_000;
+  // ─────────────────────────────────────────────────────────────────────────
+  // Private: HTTP
+  // ─────────────────────────────────────────────────────────────────────────
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Вспомогательные функции
-// ─────────────────────────────────────────────────────────────────────────────
+  /**
+   * Выполняет запрос к Telegram Bot API.
+   * @param {string} method  - Метод API (sendMessage, getMe и т.д.)
+   * @param {object} body    - Тело запроса
+   * @returns {Promise<object>} - result из ответа Telegram
+   */
+  async #request(method, body) {
+    const url        = `${this.#baseUrl}/${method}`;
+    const controller = new AbortController();
+    const timer      = setTimeout(() => controller.abort(), TELEGRAM.MAX_MESSAGE_LENGTH);
 
-/**
- * Выполняет fetch-запрос к Telegram API с таймаутом.
- *
- * @param {string} endpoint - Эндпоинт без базового URL (например: '/sendMessage')
- * @param {object} body     - Тело запроса
- * @returns {Promise<object>} - Ответ Telegram API
- */
-async function telegramRequest(endpoint, body) {
-  const url = `${TG_API_BASE}${endpoint}`;
-  const controller = new AbortController();
-  const timeoutId = setTimeout(
-    () => controller.abort(new Error(`Telegram API таймаут: ${TELEGRAM_TIMEOUT_MS}ms`)),
-    TELEGRAM_TIMEOUT_MS
-  );
+    try {
+      const response = await fetch(url, {
+        method:  'POST',
+        headers: {
+          'Content-Type':  'application/json',
+          'User-Agent':    'TelegramMarketBot/2.0',
+          'X-Correlation': getCorrelationId(),
+        },
+        body:   JSON.stringify(body),
+        signal: controller.signal,
+      });
 
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'TelegramMarketBot/1.0',
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        throw new Error(`Telegram API: malformed JSON response (HTTP ${response.status})`);
+      }
 
-    const data = await response.json();
+      if (!data.ok) {
+        const err = new Error(`Telegram API [${data.error_code}]: ${data.description}`);
+        err.code          = data.error_code;
+        err.description   = data.description;
+        err.parameters    = data.parameters;  // retry_after при 429
+        throw err;
+      }
 
-    if (!data.ok) {
-      // Формируем понятное сообщение об ошибке
-      const errMsg = `Telegram API вернул ошибку: [${data.error_code}] ${data.description}`;
-      const error = new Error(errMsg);
-      error.code = data.error_code;
-      error.description = data.description;
+      return data.result;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Public: sendMessage
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Отправляет HTML-сообщение в чат.
+   *
+   * @param {string} text              - HTML-текст
+   * @param {string} [chatId]          - ID чата (по умолчанию из config)
+   * @param {object} [extra]           - Дополнительные параметры Telegram API
+   * @returns {Promise<object>}
+   */
+  async sendMessage(text, chatId = this.#chatId, extra = {}) {
+    // Обрезаем если превышает лимит Telegram
+    if (text.length > TELEGRAM.MAX_MESSAGE_LENGTH) {
+      logger.warn(`Message too long: ${text.length}/${TELEGRAM.MAX_MESSAGE_LENGTH} chars. Truncating.`);
+      text = text.slice(0, TELEGRAM.MAX_MESSAGE_LENGTH - 120) + '\n\n<i>... (сообщение обрезано)</i>';
+    }
+
+    const payload = {
+      chat_id:                  chatId,
+      text,
+      parse_mode:               'HTML',
+      disable_web_page_preview: true,
+      disable_notification:     false,
+      ...extra,
+    };
+
+    // Throttle перед отправкой (rate limiting)
+    await this.#limiter.throttle();
+
+    const start = Date.now();
+    this.#metrics?.increment('telegram.sent');
+
+    try {
+      const result = await withRetry(
+        () => this.#request('sendMessage', payload),
+        {
+          retries: 3,
+          delay:   2_000,
+          label:   'telegram.send',
+          shouldRetry: (error) => {
+            // Не повторять при клиентских ошибках
+            if (TELEGRAM.NO_RETRY_CODES.includes(error.code)) return false;
+
+            // При flood control — ждать retry_after
+            if (error.code === TELEGRAM.FLOOD_CONTROL_CODE) {
+              const retryAfter = error.parameters?.retry_after ?? 30;
+              this.#limiter.onFloodControl(retryAfter);
+              return true; // повторять после ожидания
+            }
+
+            return true;
+          },
+        }
+      );
+
+      const latencyMs = Date.now() - start;
+      this.#metrics?.recordLatency('telegram.latency', latencyMs);
+
+      logger.info('✅ Message sent to Telegram', {
+        messageId: result?.message_id,
+        chatId,
+        latencyMs,
+        chars:     text.length,
+      });
+
+      return result;
+    } catch (error) {
+      this.#metrics?.increment('telegram.failed');
+      logger.error('Failed to send Telegram message', {
+        error:       error.message,
+        code:        error.code,
+        description: error.description,
+        chatId,
+      });
       throw error;
     }
-
-    return data.result;
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Публичные функции
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Отправляет HTML-сообщение в указанный чат.
- *
- * @param {string} text              - HTML-текст сообщения
- * @param {string} [chatId]          - ID чата (по умолчанию из config)
- * @param {object} [extraOptions={}] - Дополнительные опции Telegram API
- * @returns {Promise<object>} - Объект отправленного сообщения
- */
-export async function sendMessage(text, chatId = config.telegram.chatId, extraOptions = {}) {
-  // Проверяем длину сообщения
-  if (text.length > MAX_MESSAGE_LENGTH) {
-    logger.warn(`Сообщение превышает лимит (${text.length}/${MAX_MESSAGE_LENGTH} символов). Обрезаем.`);
-    text = text.slice(0, MAX_MESSAGE_LENGTH - 100) + '\n\n<i>... (сообщение обрезано)</i>';
   }
 
-  const payload = {
-    chat_id: chatId,
-    text,
-    parse_mode: 'HTML',
-    disable_web_page_preview: true,
-    disable_notification: false,  // true = без звука
-    ...extraOptions,
-  };
+  // ─────────────────────────────────────────────────────────────────────────
+  // Public: sendMarketBriefing
+  // ─────────────────────────────────────────────────────────────────────────
 
-  return withRetry(
-    () => telegramRequest('/sendMessage', payload),
-    {
-      retries: 3,
-      delay: 2000,
-      backoff: 2,
-      label: 'telegram-send',
-      // Не повторяем при ошибках авторизации (неверный токен, бот заблокирован)
-      shouldRetry: (error) => {
-        const noRetry = [400, 401, 403];
-        return !noRetry.includes(error.code);
-      },
+  /**
+   * Форматирует рыночные данные и отправляет сводку в Telegram.
+   * Включает защиту от дублирования (не отправлять одно и то же дважды в день).
+   *
+   * @param {object}  marketData   - Данные от MarketService
+   * @param {object}  [opts]
+   * @param {boolean} [opts.force] - Отправить даже если дубликат
+   * @returns {Promise<{ sent: boolean, messageId?: number, reason?: string }>}
+   */
+  async sendMarketBriefing(marketData, opts = {}) {
+    const now  = new Date();
+    const text = formatMarketMessage(marketData, now);
+
+    // ── Проверка дублирования ────────────────────────────────────────────
+    if (!opts.force && this.#state?.isDuplicate(text)) {
+      this.#metrics?.increment('dedup.skipped');
+      const lastSentAt = this.#state.getLastSentAt();
+      logger.warn('📋 Duplicate message detected — skipping send', {
+        lastSentAt: lastSentAt?.toISOString(),
+        reason:     'Same content already sent today',
+      });
+      return { sent: false, reason: 'duplicate' };
     }
-  );
-}
 
-/**
- * Отправляет рыночную сводку в Telegram.
- * Форматирует данные и отправляет готовое сообщение.
- *
- * @param {object} marketData - Данные котировок из marketService
- * @returns {Promise<void>}
- */
-export async function sendMarketBriefing(marketData) {
-  logger.info('Форматирование и отправка рыночной сводки...');
+    // ── Отправка ─────────────────────────────────────────────────────────
+    logger.info('Отправка рыночной сводки...', { chars: text.length });
 
-  const now = new Date();
-  const text = formatMarketMessage(marketData, now);
+    const result = await this.sendMessage(text);
 
-  logger.debug('Сформированное сообщение:', { length: text.length, preview: text.slice(0, 100) });
+    // ── Сохранение состояния ─────────────────────────────────────────────
+    if (this.#state) {
+      this.#state.setLastSentAt(now);
+      this.#state.setLastMessageHash(text);
+    }
 
-  try {
-    const result = await sendMessage(text);
-    logger.info('Рыночная сводка успешно отправлена в Telegram', {
-      messageId: result?.message_id,
-      chatId: config.telegram.chatId,
-    });
-  } catch (error) {
-    logger.error('Не удалось отправить сообщение в Telegram', {
-      error: error.message,
-      code: error.code,
-    });
-    throw error;
+    return { sent: true, messageId: result?.message_id };
   }
-}
 
-/**
- * Проверяет соединение с Telegram API (метод getMe).
- * Используется при старте для валидации токена.
- *
- * @returns {Promise<object>} - Информация о боте
- */
-export async function validateBotToken() {
-  try {
-    const botInfo = await withRetry(
-      () => telegramRequest('/getMe', {}),
-      { retries: 2, delay: 1000, label: 'telegram-getMe' }
-    );
-    logger.info('Telegram Bot токен валиден', {
-      botName: botInfo.username,
-      botId: botInfo.id,
-    });
-    return botInfo;
-  } catch (error) {
-    logger.error('Telegram Bot токен невалиден!', { error: error.message });
-    throw new Error(`Неверный TELEGRAM_BOT_TOKEN: ${error.message}`);
+  // ─────────────────────────────────────────────────────────────────────────
+  // Public: validateBotToken
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Проверяет валидность токена бота (getMe).
+   * @returns {Promise<{ id: number, username: string, firstName: string }>}
+   */
+  async validateBotToken() {
+    try {
+      const bot = await withRetry(
+        () => this.#request('getMe', {}),
+        { retries: 2, delay: 1_000, label: 'getMe' }
+      );
+
+      logger.info('✅ Telegram Bot token valid', {
+        botId:       bot.id,
+        username:    `@${bot.username}`,
+        firstName:   bot.first_name,
+      });
+
+      return {
+        id:        bot.id,
+        username:  bot.username,
+        firstName: bot.first_name,
+      };
+    } catch (error) {
+      throw new Error(`Неверный TELEGRAM_BOT_TOKEN: ${error.message}`);
+    }
+  }
+
+  /** Rate limiter stats (для /health) */
+  getRateLimiterStats() {
+    return this.#limiter.getStats();
   }
 }

@@ -1,0 +1,56 @@
+version: '3.8'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Docker Compose для Telegram Market Bot
+#
+# Запуск:           docker compose up -d
+# Остановка:        docker compose down
+# Логи:             docker compose logs -f
+# Пересборка:       docker compose up -d --build
+# Статус:           docker compose ps
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  telegram-market-bot:
+    # Собираем из локального Dockerfile
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+
+    # Имя контейнера
+    container_name: telegram-market-bot
+
+    # Политика перезапуска: всегда перезапускать при сбое
+    # (кроме случаев ручной остановки docker compose stop)
+    restart: unless-stopped
+
+    # Загружаем переменные из .env файла
+    env_file:
+      - .env
+
+    # Монтируем директорию логов на хост для доступа снаружи контейнера
+    volumes:
+      - ./logs:/app/logs
+
+    # Временная зона контейнера
+    environment:
+      - TZ=Europe/Amsterdam
+      - NODE_ENV=production
+
+    # Настройки логирования Docker
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"   # Максимальный размер файла лога
+        max-file: "5"     # Максимальное количество файлов ротации
+
+    # Ресурсные ограничения (опционально, раскомментировать при необходимости)
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '0.5'
+    #       memory: 256M
+    #     reservations:
+    #       cpus: '0.1'
+    #       memory: 64M

@@ -1,0 +1,34 @@
+# Зависимости (будут установлены в контейнере)
+node_modules/
+
+# Переменные окружения (не включать в образ!)
+.env
+.env.local
+.env.*.local
+
+# Логи
+logs/
+*.log
+
+# Инструменты разработки
+.git/
+.gitignore
+*.md
+
+# PM2
+ecosystem.config.js
+.pm2/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Docker (не нужно внутри контейнера)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db

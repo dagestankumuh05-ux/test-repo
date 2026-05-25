@@ -1,0 +1,31 @@
+{
+  "name": "telegram-market-bot",
+  "version": "1.0.0",
+  "description": "Ежедневный утренний рыночный дайджест для Telegram (BTC, ETH, Forex, Gold, Brent, IMOEX, S&P500)",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "send-now": "cross-env RUN_ON_START=true node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "node-cron": "^3.0.3"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "market",
+    "finance",
+    "crypto",
+    "twelve-data"
+  ],
+  "license": "MIT"
+}

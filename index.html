@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>MiniCraft Test</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden; background: #6ec0ff; touch-action: none;
+    -webkit-user-select: none; user-select: none; font-family: sans-serif;
+  }
+  #game-canvas { display: block; width: 100%; height: 100%; }
+
+  #crosshair {
+    position: fixed; top: 50%; left: 50%; width: 18px; height: 18px;
+    transform: translate(-50%, -50%); pointer-events: none; z-index: 5;
+  }
+  #crosshair:before, #crosshair:after {
+    content: ""; position: absolute; background: rgba(255,255,255,0.85);
+  }
+  #crosshair:before { left: 8px; top: 0; width: 2px; height: 18px; }
+  #crosshair:after { top: 8px; left: 0; height: 2px; width: 18px; }
+
+  #joystick-zone, #look-zone {
+    position: fixed; bottom: 0; top: 0; width: 45%; z-index: 4;
+  }
+  #joystick-zone { left: 0; }
+  #look-zone { right: 0; }
+
+  #joystick-base {
+    position: fixed; width: 100px; height: 100px; border-radius: 50%;
+    background: rgba(255,255,255,0.15); border: 2px solid rgba(255,255,255,0.4);
+    display: none; z-index: 6; pointer-events: none;
+  }
+  #joystick-stick {
+    position: fixed; width: 46px; height: 46px; border-radius: 50%;
+    background: rgba(255,255,255,0.55); display: none; z-index: 7; pointer-events: none;
+  }
+
+  #hud-buttons {
+    position: fixed; right: 14px; bottom: 14px; z-index: 8;
+    display: flex; flex-direction: column; gap: 12px; align-items: center;
+  }
+  .hud-btn {
+    width: 64px; height: 64px; border-radius: 50%;
+    background: rgba(20,20,20,0.45); border: 2px solid rgba(255,255,255,0.5);
+    color: #fff; font-size: 26px; display: flex; align-items: center; justify-content: center;
+    user-select: none;
+  }
+  .hud-btn:active { background: rgba(255,255,255,0.35); }
+
+  #hotbar {
+    position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%);
+    z-index: 8; display: flex; gap: 6px; background: rgba(0,0,0,0.3);
+    padding: 6px; border-radius: 10px;
+  }
+  .slot {
+    width: 44px; height: 44px; border-radius: 6px; border: 2px solid rgba(255,255,255,0.35);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .slot.selected { border-color: #fff; box-shadow: 0 0 8px #fff; }
+  .swatch { width: 30px; height: 30px; border-radius: 3px; }
+
+  #info {
+    position: fixed; top: 8px; left: 8px; z-index: 8; color: #fff;
+    font-size: 12px; text-shadow: 0 1px 2px rgba(0,0,0,0.8); line-height: 1.4;
+  }
+
+  #start-screen {
+    position: fixed; inset: 0; z-index: 20; background: linear-gradient(#6ec0ff, #bfe6ff);
+    display: flex; flex-direction: column; align-items: center; justify-content: center; color: #fff;
+    text-align: center; padding: 20px; box-sizing: border-box;
+  }
+  #start-screen h1 { font-size: 32px; margin-bottom: 4px; text-shadow: 2px 2px 0 #3a7d1f; }
+  #start-screen p { max-width: 340px; font-size: 14px; opacity: 0.9; }
+  #start-btn {
+    margin-top: 20px; padding: 14px 34px; font-size: 18px; border-radius: 8px;
+    border: none; background: #3a7d1f; color: #fff; box-shadow: 0 4px 0 #245010;
+  }
+  #start-btn:active { transform: translateY(2px); box-shadow: 0 2px 0 #245010; }
+</style>
+</head>
+<body>
+
+<canvas id="game-canvas"></canvas>
+<div id="crosshair"></div>
+<div id="joystick-zone"></div>
+<div id="look-zone"></div>
+<div id="joystick-base"></div>
+<div id="joystick-stick"></div>
+
+<div id="hud-buttons">
+  <div class="hud-btn" id="btn-place">＋</div>
+  <div class="hud-btn" id="btn-break">⛏</div>
+  <div class="hud-btn" id="btn-jump">⤒</div>
+</div>
+
+<div id="hotbar"></div>
+
+<div id="info">MiniCraft — тестовая версия</div>
+
+<div id="start-screen">
+  <h1>MiniCraft</h1>
+  <p>Самая лёгкая тестовая версия «Minecraft» для Android.
+     Левая половина экрана — джойстик движения, правая — поворот камеры.
+     Кнопки справа: поставить блок, сломать блок, прыжок.</p>
+  <button id="start-btn">Играть</button>
+</div>
+
+<script src="vendor/three.min.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  // ---------- Basic setup ----------
+  var canvas = document.getElementById("game-canvas");
+  var renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+
+  var scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x6ec0ff);
+  scene.fog = new THREE.Fog(0x6ec0ff, 20, 55);
+
+  var camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 200);
+
+  window.addEventListener("resize", function () {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // Lighting
+  var ambient = new THREE.AmbientLight(0xffffff, 0.65);
+  scene.add(ambient);
+  var sun = new THREE.DirectionalLight(0xffffff, 0.7);
+  sun.position.set(30, 50, 10);
+  scene.add(sun);
+
+  // ---------- Block types ----------
+  var COLORS = {
+    grass_top: 0x5cb32b,
+    grass_side: 0x8a5a2b,
+    dirt: 0x8a5a2b,
+    stone: 0x8a8a8a,
+    wood: 0x6b4423,
+    sand: 0xdccb7a
+  };
+
+  function makeMaterial(color) {
+    return new THREE.MeshLambertMaterial({ color: color });
+  }
+
+  var MAT = {
+    dirt: makeMaterial(COLORS.dirt),
+    stone: makeMaterial(COLORS.stone),
+    wood: makeMaterial(COLORS.wood),
+    sand: makeMaterial(COLORS.sand)
+  };
+  var grassSide = makeMaterial(COLORS.grass_side);
+  var grassTop = makeMaterial(COLORS.grass_top);
+  MAT.grass = [grassSide, grassSide, grassTop, MAT.dirt, grassSide, grassSide];
+
+  var HOTBAR_TYPES = ["grass", "dirt", "stone", "wood", "sand"];
+  var HOTBAR_SWATCH = {
+    grass: "#5cb32b", dirt: "#8a5a2b", stone: "#8a8a8a", wood: "#6b4423", sand: "#dccb7a"
+  };
+  var selectedType = "grass";
+
+  var geometry = new THREE.BoxGeometry(1, 1, 1);
+
+  // ---------- World data ----------
+  var WORLD_SIZE = 22; // blocks in x/z, from 0..WORLD_SIZE-1
+  var blocks = new Map();   // "x,y,z" -> type
+  var meshes = new Map();   // "x,y,z" -> THREE.Mesh (only rendered/exposed blocks)
+
+  function key(x, y, z) { return x + "," + y + "," + z; }
+
+  function heightAt(x, z) {
+    var h = 4 +
+      Math.round(1.6 * Math.sin(x * 0.35) * Math.cos(z * 0.35)) +
+      Math.round(1.2 * Math.sin((x + z) * 0.22));
+    return Math.max(2, Math.min(7, h));
+  }
+
+  function generateWorld() {
+    for (var x = 0; x < WORLD_SIZE; x++) {
+      for (var z = 0; z < WORLD_SIZE; z++) {
+        var h = heightAt(x, z);
+        for (var y = 0; y <= h; y++) {
+          var type;
+          if (y === h) type = "grass";
+          else if (y >= h - 2) type = "dirt";
+          else type = "stone";
+          blocks.set(key(x, y, z), type);
+        }
+      }
+    }
+    // scatter a few wood "trees" (just trunks) for flavor
+    for (var i = 0; i < 6; i++) {
+      var tx = 2 + Math.floor(Math.random() * (WORLD_SIZE - 4));
+      var tz = 2 + Math.floor(Math.random() * (WORLD_SIZE - 4));
+      var th = heightAt(tx, tz);
+      for (var ty = th + 1; ty <= th + 3; ty++) {
+        blocks.set(key(tx, ty, tz), "wood");
+      }
+    }
+  }
+
+  function neighborsOf(x, y, z) {
+    return [
+      [x + 1, y, z], [x - 1, y, z],
+      [x, y + 1, z], [x, y - 1, z],
+      [x, y, z + 1], [x, y, z - 1]
+    ];
+  }
+
+  function isFullyBuried(x, y, z) {
+    var nb = neighborsOf(x, y, z);
+    for (var i = 0; i < nb.length; i++) {
+      if (!blocks.has(key(nb[i][0], nb[i][1], nb[i][2]))) return false;
+    }
+    return true;
+  }
+
+  function ensureVisible(k, x, y, z) {
+    if (!blocks.has(k)) return;
+    if (meshes.has(k)) return;
+    if (isFullyBuried(x, y, z)) return;
+    var type = blocks.get(k);
+    var mat = MAT[type];
+    var mesh = new THREE.Mesh(geometry, mat);
+    mesh.position.set(x + 0.5, y + 0.5, z + 0.5);
+    mesh.userData.key = k;
+    mesh.userData.coord = [x, y, z];
+    scene.add(mesh);
+    meshes.set(k, mesh);
+  }
+
+  function buildInitialMeshes() {
+    blocks.forEach(function (type, k) {
+      var parts = k.split(",");
+      var x = parseInt(parts[0], 10), y = parseInt(parts[1], 10), z = parseInt(parts[2], 10);
+      ensureVisible(k, x, y, z);
+    });
+  }
+
+  function removeBlock(x, y, z) {
+    var k = key(x, y, z);
+    if (!blocks.has(k)) return;
+    if (y <= 0) return; // keep bottom layer as bedrock, cannot be broken
+    var mesh = meshes.get(k);
+    if (mesh) {
+      scene.remove(mesh);
+      meshes.delete(k);
+    }
+    blocks.delete(k);
+    var nb = neighborsOf(x, y, z);
+    for (var i = 0; i < nb.length; i++) {
+      var nk = key(nb[i][0], nb[i][1], nb[i][2]);
+      ensureVisible(nk, nb[i][0], nb[i][1], nb[i][2]);
+    }
+  }
+
+  function placeBlock(x, y, z, type) {
+    if (x < 0 || z < 0 || x >= WORLD_SIZE || z >= WORLD_SIZE || y < 0 || y > 40) return;
+    var k = key(x, y, z);
+    if (blocks.has(k)) return;
+    // don't allow placing a block on top of the player's own position
+    var px = Math.floor(player.pos.x), py = Math.floor(player.pos.y - 0.1), pz = Math.floor(player.pos.z);
+    if (x === px && z === pz && (y === py || y === py + 1)) return;
+    blocks.set(k, type);
+    ensureVisible(k, x, y, z);
+  }
+
+  generateWorld();
+  buildInitialMeshes();
+
+  // ---------- Player ----------
+  var player = {
+    pos: new THREE.Vector3(WORLD_SIZE / 2, heightAt(Math.floor(WORLD_SIZE / 2), Math.floor(WORLD_SIZE / 2)) + 2, WORLD_SIZE / 2),
+    vy: 0,
+    yaw: Math.PI,
+    pitch: -0.15,
+    onGround: false,
+    eyeHeight: 1.6
+  };
+
+  function groundHeightAt(x, z) {
+    var bx = Math.floor(x), bz = Math.floor(z);
+    if (bx < 0) bx = 0; if (bz < 0) bz = 0;
+    if (bx >= WORLD_SIZE) bx = WORLD_SIZE - 1;
+    if (bz >= WORLD_SIZE) bz = WORLD_SIZE - 1;
+    var top = 0;
+    for (var y = 40; y >= 0; y--) {
+      if (blocks.has(key(bx, y, bz))) { top = y + 1; break; }
+    }
+    return top;
+  }
+
+  // ---------- Touch controls: joystick ----------
+  var joystick = { active: false, id: null, cx: 0, cy: 0, dx: 0, dy: 0 };
+  var joyBase = document.getElementById("joystick-base");
+  var joyStick = document.getElementById("joystick-stick");
+  var joyZone = document.getElementById("joystick-zone");
+
+  function joyStart(e) {
+    var t = e.changedTouches ? e.changedTouches[0] : e;
+    joystick.active = true;
+    joystick.id = t.identifier === undefined ? "mouse" : t.identifier;
+    joystick.cx = t.clientX;
+    joystick.cy = t.clientY;
+    joystick.dx = 0; joystick.dy = 0;
+    joyBase.style.left = (t.clientX - 50) + "px";
+    joyBase.style.top = (t.clientY - 50) + "px";
+    joyBase.style.display = "block";
+    joyStick.style.display = "block";
+    joyStick.style.left = (t.clientX - 23) + "px";
+    joyStick.style.top = (t.clientY - 23) + "px";
+    e.preventDefault();
+  }
+  function joyMove(e) {
+    if (!joystick.active) return;
+    var touches = e.changedTouches || [e];
+    for (var i = 0; i < touches.length; i++) {
+      var t = touches[i];
+      var id = t.identifier === undefined ? "mouse" : t.identifier;
+      if (id !== joystick.id) continue;
+      var dx = t.clientX - joystick.cx;
+      var dy = t.clientY - joystick.cy;
+      var max = 46;
+      var len = Math.sqrt(dx * dx + dy * dy);
+      if (len > max) { dx = dx / len * max; dy = dy / len * max; }
+      joystick.dx = dx / max;
+      joystick.dy = dy / max;
+      joyStick.style.left = (joystick.cx + dx - 23) + "px";
+      joyStick.style.top = (joystick.cy + dy - 23) + "px";
+    }
+    e.preventDefault();
+  }
+  function joyEnd(e) {
+    var touches = e.changedTouches || [e];
+    for (var i = 0; i < touches.length; i++) {
+      var t = touches[i];
+      var id = t.identifier === undefined ? "mouse" : t.identifier;
+      if (id !== joystick.id) continue;
+      joystick.active = false;
+      joystick.dx = 0; joystick.dy = 0;
+      joyBase.style.display = "none";
+      joyStick.style.display = "none";
+    }
+    e.preventDefault();
+  }
+  joyZone.addEventListener("touchstart", joyStart, { passive: false });
+  joyZone.addEventListener("touchmove", joyMove, { passive: false });
+  joyZone.addEventListener("touchend", joyEnd, { passive: false });
+  joyZone.addEventListener("touchcancel", joyEnd, { passive: false });
+  joyZone.addEventListener("mousedown", joyStart);
+  window.addEventListener("mousemove", joyMove);
+  window.addEventListener("mouseup", joyEnd);
+
+  // ---------- Touch controls: look ----------
+  var look = { active: false, id: null, lastX: 0, lastY: 0 };
+  var lookZone = document.getElementById("look-zone");
+
+  function lookStart(e) {
+    var t = e.changedTouches ? e.changedTouches[0] : e;
+    look.active = true;
+    look.id = t.identifier === undefined ? "mouse" : t.identifier;
+    look.lastX = t.clientX;
+    look.lastY = t.clientY;
+    e.preventDefault();
+  }
+  function lookMove(e) {
+    if (!look.active) return;
+    var touches = e.changedTouches || [e];
+    for (var i = 0; i < touches.length; i++) {
+      var t = touches[i];
+      var id = t.identifier === undefined ? "mouse" : t.identifier;
+      if (id !== look.id) continue;
+      var dx = t.clientX - look.lastX;
+      var dy = t.clientY - look.lastY;
+      look.lastX = t.clientX;
+      look.lastY = t.clientY;
+      player.yaw -= dx * 0.005;
+      player.pitch -= dy * 0.005;
+      var lim = Math.PI / 2 - 0.05;
+      if (player.pitch > lim) player.pitch = lim;
+      if (player.pitch < -lim) player.pitch = -lim;
+    }
+    e.preventDefault();
+  }
+  function lookEnd(e) {
+    var touches = e.changedTouches || [e];
+    for (var i = 0; i < touches.length; i++) {
+      var t = touches[i];
+      var id = t.identifier === undefined ? "mouse" : t.identifier;
+      if (id !== look.id) continue;
+      look.active = false;
+    }
+    e.preventDefault();
+  }
+  lookZone.addEventListener("touchstart", lookStart, { passive: false });
+  lookZone.addEventListener("touchmove", lookMove, { passive: false });
+  lookZone.addEventListener("touchend", lookEnd, { passive: false });
+  lookZone.addEventListener("touchcancel", lookEnd, { passive: false });
+  lookZone.addEventListener("mousedown", lookStart);
+  window.addEventListener("mousemove", lookMove);
+  window.addEventListener("mouseup", lookEnd);
+
+  // ---------- Buttons ----------
+  var wantJump = false;
+  document.getElementById("btn-jump").addEventListener("touchstart", function (e) { wantJump = true; e.preventDefault(); }, { passive: false });
+  document.getElementById("btn-jump").addEventListener("mousedown", function () { wantJump = true; });
+
+  var raycaster = new THREE.Raycaster();
+  var center = new THREE.Vector2(0, 0);
+  var REACH = 6;
+
+  function pick() {
+    raycaster.setFromCamera(center, camera);
+    raycaster.far = REACH;
+    var objs = Array.from(meshes.values());
+    var hits = raycaster.intersectObjects(objs, false);
+    return hits.length ? hits[0] : null;
+  }
+
+  function doBreak() {
+    var hit = pick();
+    if (!hit) return;
+    var c = hit.object.userData.coord;
+    removeBlock(c[0], c[1], c[2]);
+  }
+
+  function doPlace() {
+    var hit = pick();
+    if (!hit) return;
+    var c = hit.object.userData.coord;
+    var n = hit.face.normal;
+    var tx = c[0] + Math.round(n.x);
+    var ty = c[1] + Math.round(n.y);
+    var tz = c[2] + Math.round(n.z);
+    placeBlock(tx, ty, tz, selectedType);
+  }
+
+  document.getElementById("btn-break").addEventListener("touchstart", function (e) { doBreak(); e.preventDefault(); }, { passive: false });
+  document.getElementById("btn-break").addEventListener("click", doBreak);
+  document.getElementById("btn-place").addEventListener("touchstart", function (e) { doPlace(); e.preventDefault(); }, { passive: false });
+  document.getElementById("btn-place").addEventListener("click", doPlace);
+
+  // ---------- Hotbar ----------
+  var hotbarEl = document.getElementById("hotbar");
+  HOTBAR_TYPES.forEach(function (type, i) {
+    var slot = document.createElement("div");
+    slot.className = "slot" + (type === selectedType ? " selected" : "");
+    var sw = document.createElement("div");
+    sw.className = "swatch";
+    sw.style.background = HOTBAR_SWATCH[type];
+    slot.appendChild(sw);
+    slot.addEventListener("click", function () { selectType(type); });
+    slot.addEventListener("touchstart", function (e) { selectType(type); e.preventDefault(); }, { passive: false });
+    hotbarEl.appendChild(slot);
+  });
+  function selectType(type) {
+    selectedType = type;
+    Array.from(hotbarEl.children).forEach(function (el, i) {
+      el.classList.toggle("selected", HOTBAR_TYPES[i] === type);
+    });
+  }
+
+  // ---------- Start screen ----------
+  document.getElementById("start-btn").addEventListener("click", function () {
+    document.getElementById("start-screen").style.display = "none";
+  });
+
+  // ---------- Game loop ----------
+  var GRAVITY = 20;
+  var JUMP_SPEED = 8;
+  var MOVE_SPEED = 4.2;
+  var clock = new THREE.Clock();
+
+  function update(dt) {
+    // orientation
+    var forward = new THREE.Vector3(Math.sin(player.yaw), 0, Math.cos(player.yaw));
+    var right = new THREE.Vector3(Math.sin(player.yaw + Math.PI / 2), 0, Math.cos(player.yaw + Math.PI / 2));
+
+    var moveX = joystick.dx;
+    var moveZ = joystick.dy; // forward when dy negative (finger moved up)
+
+    var delta = new THREE.Vector3();
+    delta.addScaledVector(forward, -moveZ);
+    delta.addScaledVector(right, moveX);
+    if (delta.lengthSq() > 1) delta.normalize();
+    delta.multiplyScalar(MOVE_SPEED * dt);
+
+    player.pos.x += delta.x;
+    player.pos.z += delta.z;
+    player.pos.x = Math.max(0.5, Math.min(WORLD_SIZE - 0.5, player.pos.x));
+    player.pos.z = Math.max(0.5, Math.min(WORLD_SIZE - 0.5, player.pos.z));
+
+    // vertical physics
+    var ground = groundHeightAt(player.pos.x, player.pos.z);
+    player.vy -= GRAVITY * dt;
+    player.pos.y += player.vy * dt;
+
+    if (player.pos.y <= ground + player.eyeHeight - 1.0) {
+      player.pos.y = ground + player.eyeHeight - 1.0;
+      player.vy = 0;
+      player.onGround = true;
+    } else {
+      player.onGround = false;
+    }
+
+    if (wantJump) {
+      if (player.onGround) {
+        player.vy = JUMP_SPEED;
+        player.onGround = false;
+      }
+      wantJump = false;
+    }
+
+    camera.position.copy(player.pos);
+    camera.rotation.order = "YXZ";
+    camera.rotation.y = player.yaw;
+    camera.rotation.x = player.pitch;
+  }
+
+  function loop() {
+    var dt = Math.min(clock.getDelta(), 0.05);
+    update(dt);
+    renderer.render(scene, camera);
+    requestAnimationFrame(loop);
+  }
+  loop();
+})();
+</script>
+</body>
+</html>
